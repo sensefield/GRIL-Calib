@@ -466,7 +466,33 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr &msg) {
 
     // Ground Segmentation TODO : other lidar type
     if (lidar_type == VELO || lidar_type == VELO_NCLT || lidar_type == OUSTER || lidar_type == PANDAR || lidar_type == VELO_without_Time) {
-        pcl::fromROSMsg(*msg, curr_points);
+        if (lidar_type == PANDAR) {
+            // pcl::fromROSMsg fails for PANDAR because intensity is uint8 in the message
+            // but pcl::PointXYZI expects float. Read directly from raw buffer instead.
+            curr_points.clear();
+            int off_x = -1, off_y = -1, off_z = -1, off_intensity = -1;
+            for (const auto& field : msg->fields) {
+                if      (field.name == "x")         off_x         = field.offset;
+                else if (field.name == "y")         off_y         = field.offset;
+                else if (field.name == "z")         off_z         = field.offset;
+                else if (field.name == "intensity") off_intensity = field.offset;
+            }
+            int plsize = msg->width * msg->height;
+            curr_points.reserve(plsize);
+            for (int i = 0; i < plsize; i++) {
+                const uint8_t* ptr = &msg->data[i * msg->point_step];
+                pcl::PointXYZI pt;
+                memcpy(&pt.x, ptr + off_x, sizeof(float));
+                memcpy(&pt.y, ptr + off_y, sizeof(float));
+                memcpy(&pt.z, ptr + off_z, sizeof(float));
+                uint8_t intensity_raw = 0;
+                if (off_intensity >= 0) memcpy(&intensity_raw, ptr + off_intensity, sizeof(uint8_t));
+                pt.intensity = static_cast<float>(intensity_raw);
+                curr_points.push_back(pt);
+            }
+        } else {
+            pcl::fromROSMsg(*msg, curr_points);
+        }
 
         PatchworkppGroundSeg->estimate_ground(curr_points, ground_points, non_ground_points, time_taken);
 
@@ -1023,7 +1049,7 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 20, standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
 
