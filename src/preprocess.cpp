@@ -302,7 +302,54 @@ Preprocess::process_cut_frame_pcl2(const sensor_msgs::msg::PointCloud2::UniquePt
             pl_surf.points.push_back(added_pt);
         }
 
-    } 
+    }
+    else if (lidar_type == PANDAR) {
+        // Read all fields directly from raw buffer to avoid PCL struct alignment mismatch
+        int plsize = msg->width * msg->height;
+        pl_surf.reserve(plsize);
+
+        int off_x = -1, off_y = -1, off_z = -1, off_intensity = -1, off_time_stamp = -1;
+        for (const auto& field : msg->fields) {
+            if      (field.name == "x")          off_x          = field.offset;
+            else if (field.name == "y")          off_y          = field.offset;
+            else if (field.name == "z")          off_z          = field.offset;
+            else if (field.name == "intensity")  off_intensity  = field.offset;
+            else if (field.name == "time_stamp") off_time_stamp = field.offset;
+        }
+
+        for (int i = 0; i < plsize; i++) {
+            if (i % point_filter_num != 0) continue;
+
+            const uint8_t* ptr = &msg->data[i * msg->point_step];
+
+            float x, y, z;
+            memcpy(&x, ptr + off_x, sizeof(float));
+            memcpy(&y, ptr + off_y, sizeof(float));
+            memcpy(&z, ptr + off_z, sizeof(float));
+
+            double range = x * x + y * y + z * z;
+            if (range < blind) continue;
+
+            uint8_t intensity_raw = 0;
+            if (off_intensity >= 0) memcpy(&intensity_raw, ptr + off_intensity, sizeof(uint8_t));
+
+            // time_stamp is UINT32 (datatype=6), nanosecond offset within scan
+            uint32_t time_stamp_ns = 0;
+            if (off_time_stamp >= 0) memcpy(&time_stamp_ns, ptr + off_time_stamp, sizeof(uint32_t));
+
+            PointType added_pt;
+            added_pt.x = x;
+            added_pt.y = y;
+            added_pt.z = z;
+            added_pt.intensity = static_cast<float>(intensity_raw);
+            added_pt.normal_x = 0;
+            added_pt.normal_y = 0;
+            added_pt.normal_z = 0;
+            added_pt.curvature = static_cast<double>(time_stamp_ns) / 1e6; // ns -> ms
+
+            pl_surf.points.push_back(added_pt);
+        }
+    }
     else {
         // ROS_ERROR("Lidar type not supported!");
         std::cerr << "Lidar type not supported!" << std::endl;
