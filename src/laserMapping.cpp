@@ -34,6 +34,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <cstdlib>
 #include <omp.h>
 #include "IMU_Processing.hpp"
 #include <unistd.h>
@@ -140,7 +141,7 @@ ofstream fout_result;
 // LI Init Related
 MatrixXd Jaco_rot(30000, 3);
 ofstream fout_out;
-FILE *fp;
+FILE *fp = nullptr;
 
 vector<BoxPointType> cub_needrm;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
@@ -539,18 +540,41 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr &msg_in) {
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
     //IMU Time Compensation
-    msg->header.stamp = get_ros_time(get_time_sec(msg->header.stamp) - timediff_imu_wrt_lidar - time_lag_IMU_wtr_lidar);
+    double compensated_time = get_time_sec(msg->header.stamp) - timediff_imu_wrt_lidar - time_lag_IMU_wtr_lidar;
+    if (compensated_time < 0.0) {
+        std::cerr << "IMU timestamp went negative after compensation (" << compensated_time
+                  << "), skipping message." << std::endl;
+        mtx_buffer.unlock();
+        return;
+    }
+    msg->header.stamp = get_ros_time(compensated_time);
 
     double timestamp = get_time_sec(msg->header.stamp);
 
     if (timestamp < last_timestamp_imu) {
-        std::cerr << "IMU loop back, clear IMU buffer." << std::endl;
-        imu_buffer.clear();
-        Calib_LI->IMU_buffer_clear();
+        const double rewind = last_timestamp_imu - timestamp;
+        // Only treat a large backward jump (>=0.5s) as a real loop-back — e.g. a rosbag
+        // rewind, or the one-shot inconsistency from the first shifted sample after
+        // timediff_imu_wrt_lidar is initially set (~1s). In those cases the accumulated
+        // history is either stale or on a different time base, so wiping IMU_state_group_ALL
+        // is appropriate.
+        //
+        // Small regressions (a few ms) are benign out-of-order DDS deliveries; wiping
+        // IMU_state_group_ALL on every occurrence used to leave downsample_interpolate_IMU
+        // dereferencing an empty deque (SIGSEGV). Drop the offending sample only.
+        if (rewind >= 0.5) {
+            std::cerr << "IMU loop back (rewind=" << rewind << "s), clear IMU buffer." << std::endl;
+            imu_buffer.clear();
+            Calib_LI->IMU_buffer_clear();
+        } else {
+            mtx_buffer.unlock();
+            sig_buffer.notify_all();
+            return;
+        }
     }
 
     last_timestamp_imu = timestamp;
-    
+
     imu_buffer.push_back(msg);
 
     // push all IMU meas into Calib_LI
@@ -599,6 +623,17 @@ bool sync_packages(MeasureGroup &meas) {
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
     }
+
+    if (meas.imu.empty()) {
+        // Happens right after an IMU loop-back clears the buffer: every remaining IMU
+        // sample is newer than this lidar frame. Drop the stale lidar frame and retry
+        // — otherwise timer_callback dereferences Measures.imu.front() on an empty deque.
+        lidar_buffer.pop_front();
+        time_buffer.pop_front();
+        lidar_pushed = false;
+        return false;
+    }
+
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
@@ -1078,7 +1113,7 @@ public:
     ~LaserMappingNode(){
         fout_out.close();
         fout_result.close();
-        fclose(fp);
+        if (fp != nullptr) fclose(fp);
     }
 
 private:
@@ -1444,7 +1479,13 @@ private:
             kdtree_size_end = ikdtree.size();
 
             /***** Device starts to move, data accmulation begins. ****/
-            if (!imu_en && !data_accum_start && state.pos_end.norm() > 0.05) {
+            // Require AHRS to have converged before starting accumulation, otherwise
+            // imu_q_eigen / lidar_q / normal_lidar / lidar_estimate_height stay at their
+            // init values (identity quaternion, zero vector, 0) and get pushed into
+            // Calib_LI->push_Plane_Constraint as invalid constraints. Those drive
+            // LI_Calibration's internal interpolation off the rails and crash it.
+            if (!imu_en && !data_accum_start && state.pos_end.norm() > 0.05
+                && !FusionAhrsGetFlags(&ahrs).initialising) {
                 printf(BOLDCYAN "[Initialization] Movement detected, data accumulation starts.\n\n\n\n\n" RESET);
                 data_accum_start = true;
                 move_start_time = lidar_end_time;
@@ -1546,11 +1587,11 @@ int main(int argc, char** argv)
     if (rclcpp::ok())
         rclcpp::shutdown();
 
-    /**************** save trajectory ****************/
-    if(traj_save_en){
-        saveTrajectory(traj_save_path);
-        std::cout << "save LiDAR trajectory !!" << std::endl;  
-    }
-
-    return 0;
+    // Trajectory is already saved from inside LI_Calibration on successful completion,
+    // so doing it again here just prints the log line twice. Global publishers/subscribers
+    // (pub_cloud, pub_ground, pub_non_ground, PatchworkppGroundSeg) are globals whose
+    // destructors run after rclcpp::shutdown and then complain "Failed to delete
+    // datawriter" / "cannot publish data" against the already-torn-down rmw context.
+    // None of this affects the calibration result, so skip the destructors with _Exit.
+    std::_Exit(0);
 }
