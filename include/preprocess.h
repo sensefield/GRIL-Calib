@@ -97,23 +97,31 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(ouster_ros::Point,
     (std::uint32_t, range, range)
 )
 
-// namespace pandar_ros
+// namespace pandar_ros (Autoware pointcloud_raw_ex format)
+// Note: time_stamp (uint64) is not registered as PCL does not support uint64 in type traits.
+//       It is read directly from the raw PointCloud2 buffer in preprocess.cpp.
 namespace pandar_ros {
     struct EIGEN_ALIGN16 Point {
         PCL_ADD_POINT4D;
-        float intensity;
-        double timestamp;
-        uint16_t  ring;
+        uint8_t intensity;
+        uint8_t return_type;
+        uint16_t channel;
+        float azimuth;
+        float elevation;
+        float distance;
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     };
 }
 POINT_CLOUD_REGISTER_POINT_STRUCT(pandar_ros::Point,
                                   (float, x, x)
-                                          (float, y, y)
-                                          (float, z, z)
-                                          (float, intensity, intensity)
-                                          (double, timestamp, timestamp)
-                                          (std::uint16_t, ring, ring)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (std::uint8_t, intensity, intensity)
+                                  (std::uint8_t, return_type, return_type)
+                                  (std::uint16_t, channel, channel)
+                                  (float, azimuth, azimuth)
+                                  (float, elevation, elevation)
+                                  (float, distance, distance)
 )
 
 class Preprocess

@@ -117,19 +117,39 @@ void Gril_Calib::push_Plane_Constraint(const Eigen::Quaterniond &q_lidar, const 
 }
 
 void Gril_Calib::downsample_interpolate_IMU(const double &move_start_time) {
+    std::cerr << "[trace] downsample_interpolate_IMU: enter  "
+              << "IMU_ALL=" << IMU_state_group_ALL.size()
+              << " Lidar=" << Lidar_state_group.size()
+              << " move_start_time=" << move_start_time << std::endl;
 
-    while (IMU_state_group_ALL.front().timeStamp < move_start_time - 3.0)
+    while (!IMU_state_group_ALL.empty() &&
+           IMU_state_group_ALL.front().timeStamp < move_start_time - 3.0)
         IMU_state_group_ALL.pop_front();
-    while (Lidar_state_group.front().timeStamp < move_start_time - 3.0)
+    while (!Lidar_state_group.empty() &&
+           Lidar_state_group.front().timeStamp < move_start_time - 3.0)
         Lidar_state_group.pop_front();
+
+    std::cerr << "[trace] downsample_interpolate_IMU: after trim  "
+              << "IMU_ALL=" << IMU_state_group_ALL.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
 
     // Original IMU measurements
     deque<CalibState> IMU_states_all_origin;
+    if (IMU_state_group_ALL.empty()) {
+        std::cerr << "[trace] downsample_interpolate_IMU: IMU_ALL empty after trim, aborting" << std::endl;
+        return;
+    }
     IMU_states_all_origin.assign(IMU_state_group_ALL.begin(), IMU_state_group_ALL.end() - 1);
 
     // Mean filter to attenuate noise
     int mean_filt_size = 3;
-    for (int i = mean_filt_size; i < IMU_state_group_ALL.size() - mean_filt_size; i++) {
+    // Guard unsigned underflow when IMU_state_group_ALL.size() < 2 * mean_filt_size
+    if (IMU_state_group_ALL.size() <= static_cast<size_t>(2 * mean_filt_size)) {
+        std::cerr << "[trace] downsample_interpolate_IMU: IMU_ALL too small ("
+                  << IMU_state_group_ALL.size() << "), skipping mean filter" << std::endl;
+    }
+    for (int i = mean_filt_size;
+         i < static_cast<int>(IMU_state_group_ALL.size()) - mean_filt_size; i++) {
         V3D acc_real = Zero3d;
         for (int k = -mean_filt_size; k < mean_filt_size + 1; k++)
             acc_real += (IMU_states_all_origin[i + k].linear_acc - acc_real) / (k + mean_filt_size + 1);
@@ -234,13 +254,21 @@ void Gril_Calib::xcorr_temporal_init(const double &odom_freq) {
 
 void Gril_Calib::IMU_time_compensate(const double &lag_time, const bool &is_discard) {
     if (is_discard) {
-        // Discard first 10 Lidar estimations and corresponding IMU measurements due to long time interval
-        int i = 0;
-        while (i < 10) {
+        // Discard first 10 Lidar estimations and corresponding IMU measurements due to long time interval.
+        // Clamp so we never pop past size() — data_sufficiency_assess may finish on as few as a handful of
+        // frames if the rotation is extreme, which then makes unbounded pop_front UB (SIGSEGV).
+        const size_t n_discard =
+            std::min<size_t>(10, std::min(Lidar_state_group.size(), IMU_state_group.size()));
+        for (size_t i = 0; i < n_discard; ++i) {
             Lidar_state_group.pop_front();
             IMU_state_group.pop_front();
-            i++;
         }
+    }
+
+    if (IMU_state_group.empty() || Lidar_state_group.empty()) {
+        std::cerr << "[IMU_time_compensate] IMU or Lidar state group empty after discard, aborting compensation"
+                  << std::endl;
+        return;
     }
 
     auto it_IMU_state = IMU_state_group.begin();
@@ -248,11 +276,13 @@ void Gril_Calib::IMU_time_compensate(const double &lag_time, const bool &is_disc
         it_IMU_state->timeStamp = it_IMU_state->timeStamp - lag_time;
     }
 
-    while (Lidar_state_group.front().timeStamp < IMU_state_group.front().timeStamp)
-        Lidar_state_group.pop_front();  
+    while (!Lidar_state_group.empty() && !IMU_state_group.empty() &&
+           Lidar_state_group.front().timeStamp < IMU_state_group.front().timeStamp)
+        Lidar_state_group.pop_front();
 
-    while (Lidar_state_group.front().timeStamp > IMU_state_group[1].timeStamp)
-        IMU_state_group.pop_front();   
+    while (!Lidar_state_group.empty() && IMU_state_group.size() >= 2 &&
+           Lidar_state_group.front().timeStamp > IMU_state_group[1].timeStamp)
+        IMU_state_group.pop_front();
 
     // align the size of two sequences
     while (IMU_state_group.size() > Lidar_state_group.size())
@@ -262,13 +292,18 @@ void Gril_Calib::IMU_time_compensate(const double &lag_time, const bool &is_disc
 }
 
 void Gril_Calib::cut_sequence_tail() {
-    for (int i = 0; i < 20; ++i) {
+    // Clamp the 20-sample tail cut to what's actually available.
+    const size_t n_cut =
+        std::min<size_t>(20, std::min(Lidar_state_group.size(), IMU_state_group.size()));
+    for (size_t i = 0; i < n_cut; ++i) {
         Lidar_state_group.pop_back();
         IMU_state_group.pop_back();
     }
-    while (Lidar_state_group.front().timeStamp < IMU_state_group.front().timeStamp)
+    while (!Lidar_state_group.empty() && !IMU_state_group.empty() &&
+           Lidar_state_group.front().timeStamp < IMU_state_group.front().timeStamp)
         Lidar_state_group.pop_front();
-    while (Lidar_state_group.front().timeStamp > IMU_state_group[1].timeStamp)
+    while (!Lidar_state_group.empty() && IMU_state_group.size() >= 2 &&
+           Lidar_state_group.front().timeStamp > IMU_state_group[1].timeStamp)
         IMU_state_group.pop_front();
 
     //Align the size of two sequences
@@ -302,6 +337,16 @@ void Gril_Calib::acc_interpolate() {
 void Gril_Calib::Butter_filt(const deque<CalibState> &signal_in, deque<CalibState> &signal_out) {
     Gril_Calib::Butterworth butter;
     butter.extend_num = 10 * (butter.Coeff_size - 1);
+    // Butterworth pads each end with `extend_num` mirrored samples, so the input must be
+    // longer than 2 * extend_num. Otherwise `signal_in.begin() + extend_num` overruns end()
+    // and dereferencing `*it_front` is UB (observed as SIGBUS on x86 due to misaligned
+    // load into Eigen members of CalibState).
+    if (signal_in.size() <= static_cast<size_t>(2 * butter.extend_num)) {
+        std::cerr << "[Butter_filt] input too short: size=" << signal_in.size()
+                  << " required>" << (2 * butter.extend_num) << "; skipping filter" << std::endl;
+        signal_out = signal_in;  // pass through
+        return;
+    }
     auto it_front = signal_in.begin() + butter.extend_num;
     auto it_back = signal_in.end() - 1 - butter.extend_num;
 
@@ -651,10 +696,32 @@ bool Gril_Calib::data_sufficiency_assess(MatrixXd &Jacobian_rot, int &frame_num,
         
 
         fflush(stdout);
-        if (Rot_percent[axis[0]] > x_accumulate && Rot_percent[axis[1]] > y_accumulate && Rot_percent[axis[2]] > z_accumulate) {
+        // Minimum frame count guard. Aggressive rotation can satisfy the eigenvalue-product
+        // threshold very quickly, but the downstream pipeline has hard minimum sizes:
+        //   - IMU_time_compensate(0.0, true) pops 10 from front
+        //   - zero_phase_filt -> Butter_filt needs signal.size() > 2 * extend_num (= 120)
+        //     where extend_num = 10 * (Coeff_size - 1) = 60
+        //   - cut_sequence_tail pops 20 from back
+        // Tightest constraint is the first zero_phase_filt call, which runs after the 10-pop,
+        // so size_at_data_accum_finished must exceed 10 + 120 = 130. Use 150 as a safety margin.
+        constexpr size_t MIN_LIDAR_FRAMES = 150;
+        const bool eigen_ok =
+            Rot_percent[axis[0]] > x_accumulate &&
+            Rot_percent[axis[1]] > y_accumulate &&
+            Rot_percent[axis[2]] > z_accumulate;
+        const bool have_enough_frames =
+            Lidar_state_group.size() >= MIN_LIDAR_FRAMES &&
+            IMU_state_group_ALL.size() >= MIN_LIDAR_FRAMES;
+        if (eigen_ok && have_enough_frames) {
             printf(BOLDCYAN "[calibration] Data accumulation finished, Lidar IMU calibration begins.\n\n" RESET);
             printf(BOLDBLUE"============================================================ \n\n" RESET);
             data_sufficient = true;
+        } else if (eigen_ok) {
+            // eigenvalue criterion satisfied but frame count still too small — keep accumulating
+            std::cerr << "[data_sufficiency_assess] eigenvalue threshold met but only "
+                      << Lidar_state_group.size() << " lidar frames / "
+                      << IMU_state_group_ALL.size() << " imu samples; waiting for >= "
+                      << MIN_LIDAR_FRAMES << " frames" << std::endl;
         }
     }
 
@@ -688,43 +755,65 @@ void Gril_Calib::clear() {
 //** main function in LiDAR IMU calibration **//
 void Gril_Calib::LI_Calibration(int &orig_odom_freq, int &cut_frame_num, double &timediff_imu_wrt_lidar,
                                 const double &move_start_time) {
+    std::cerr << "[trace] LI_Calibration: enter" << std::endl;
 
     TimeConsuming time("Batch optimization");
 
-    downsample_interpolate_IMU(move_start_time);    
-    fout_before_filter();                           
-    IMU_time_compensate(0.0, true); 
+    std::cerr << "[trace] LI_Calibration: call downsample_interpolate_IMU" << std::endl;
+    downsample_interpolate_IMU(move_start_time);
+    std::cerr << "[trace] LI_Calibration: call fout_before_filter  IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
+    fout_before_filter();
+    std::cerr << "[trace] LI_Calibration: call IMU_time_compensate(0.0, true)" << std::endl;
+    IMU_time_compensate(0.0, true);
 
     deque<CalibState> IMU_after_zero_phase;
     deque<CalibState> Lidar_after_zero_phase;
-    zero_phase_filt(get_IMU_state(), IMU_after_zero_phase); // zero phase low-pass filter
-    normalize_acc(IMU_after_zero_phase);   
+    std::cerr << "[trace] LI_Calibration: 1st zero_phase_filt IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
+    zero_phase_filt(get_IMU_state(), IMU_after_zero_phase);
+    normalize_acc(IMU_after_zero_phase);
     zero_phase_filt(get_Lidar_state(), Lidar_after_zero_phase);
     set_IMU_state(IMU_after_zero_phase);
     set_Lidar_state(Lidar_after_zero_phase);
-    cut_sequence_tail(); 
+    std::cerr << "[trace] LI_Calibration: cut_sequence_tail IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
+    cut_sequence_tail();
 
+    std::cerr << "[trace] LI_Calibration: xcorr_temporal_init IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
     xcorr_temporal_init(orig_odom_freq * cut_frame_num);
+    std::cerr << "[trace] LI_Calibration: IMU_time_compensate(lag1=" << get_lag_time_1() << ", false)" << std::endl;
     IMU_time_compensate(get_lag_time_1(), false);
 
 
-    central_diff(); 
+    std::cerr << "[trace] LI_Calibration: central_diff IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
+    central_diff();
 
     deque<CalibState> IMU_after_2nd_zero_phase;
     deque<CalibState> Lidar_after_2nd_zero_phase;
+    std::cerr << "[trace] LI_Calibration: 2nd zero_phase_filt" << std::endl;
     zero_phase_filt(get_IMU_state(), IMU_after_2nd_zero_phase);
     zero_phase_filt(get_Lidar_state(), Lidar_after_2nd_zero_phase);
 
-    // IMU의 angular acc, LiDAR의 angular acc, linear acc를 구하고 IMU_state_group, Lidar_state_group에 저장한다.
-    set_states_2nd_filter(IMU_after_2nd_zero_phase, Lidar_after_2nd_zero_phase);    
-    fout_check_lidar(); // file output for visualizing lidar low pass filter
+    std::cerr << "[trace] LI_Calibration: set_states_2nd_filter" << std::endl;
+    set_states_2nd_filter(IMU_after_2nd_zero_phase, Lidar_after_2nd_zero_phase);
+    fout_check_lidar();
 
+    std::cerr << "[trace] LI_Calibration: solve_Rotation_only IMU=" << IMU_state_group.size()
+              << " Lidar=" << Lidar_state_group.size() << std::endl;
     solve_Rotation_only();
+    std::cerr << "[trace] LI_Calibration: acc_interpolate" << std::endl;
     acc_interpolate();
+    std::cerr << "[trace] LI_Calibration: align_Group  Lidar_grp=" << Lidar_wrt_ground_group.size()
+              << " IMU_grp=" << IMU_wrt_ground_group.size()
+              << " normal=" << normal_vector_wrt_lidar_group.size()
+              << " dist=" << distance_Lidar_wrt_ground_group.size() << std::endl;
     align_Group(IMU_state_group, Lidar_wrt_ground_group, IMU_wrt_ground_group,
                 normal_vector_wrt_lidar_group, distance_Lidar_wrt_ground_group);
 
-    // Calibration at once
+    std::cerr << "[trace] LI_Calibration: solve_Rot_Trans_calib" << std::endl;
     solve_Rot_Trans_calib(timediff_imu_wrt_lidar, imu_sensor_height);
 
     printf(BOLDBLUE"============================================================ \n\n" RESET);
